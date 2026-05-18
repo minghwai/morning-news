@@ -39,12 +39,14 @@ jobs:
       - name: 시스템 패키지 설치 (한국어 폰트 + Xvfb)
         run: |
           sudo apt-get update -q
+          sudo apt-cache search libasound2  # Debug: Validate availability
+          sudo add-apt-repository universe  # Ensure all repos are available
           sudo apt-get install -y -q \
             fonts-nanum \
             xvfb \
             libgbm1 \
             libasound2 \
-            libxss1
+            libxss1 || sudo apt-get install -y libasound2t64  # Retry with alternative
 
       - name: Python 패키지 설치
         run: pip install -r requirements.txt
