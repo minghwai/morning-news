@@ -1,0 +1,139 @@
+name: 공기업 주요 언론 보도 PDF
+
+on:
+  schedule:
+    # 매일 오전 8:00 KST = 23:00 UTC (전날)
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: '검색 키워드 (예: 한국전력공사)'
+        required: false
+        default: '한국전력공사'
+      no_screenshot:
+        description: '신문사 스크린샷 생략'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+env:
+  DEFAULT_KEYWORD: '한국전력공사'
+  TZ: 'Asia/Seoul'
+
+jobs:
+  generate-pdf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 시스템 패키지 설치 (한국어 폰트 + Xvfb)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q \
+            fonts-nanum \
+            xvfb \
+            libgbm1 \
+            libasound2 \
+            libxss1
+
+      - name: Python 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: Playwright Chromium 설치
+        run: playwright install chromium --with-deps
+
+      - name: 날짜 설정 (KST 기준)
+        run: echo "DATE=$(TZ=Asia/Seoul date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: 키워드 결정
+        id: kw
+        run: |
+          KW="${{ github.event.inputs.keyword }}"
+          if [ -z "$KW" ]; then KW="$DEFAULT_KEYWORD"; fi
+          echo "value=$KW" >> $GITHUB_OUTPUT
+          echo "키워드: $KW"
+
+      - name: PDF 생성
+        env:
+          KEYWORD: ${{ steps.kw.outputs.value }}
+          NO_SCREENSHOT: ${{ github.event.inputs.no_screenshot || 'false' }}
+        run: |
+          if [ "$NO_SCREENSHOT" = "true" ]; then
+            python -m src.main --keyword "$KEYWORD" --no-screenshot
+          else
+            # Xvfb로 가상 디스플레이 생성 (Chromium 렌더링용)
+            xvfb-run --auto-servernum --server-args="-screen 0 1440x900x24" \
+              python -m src.main --keyword "$KEYWORD"
+          fi
+
+      - name: PDF Artifact 업로드 (90일 보관)
+        uses: actions/upload-artifact@v4
+        with:
+          name: morning-news-${{ steps.kw.outputs.value }}-${{ env.DATE }}
+          path: output/*.pdf
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ── 이메일 발송 (Secrets 설정 시 활성화) ─────────────────────────
+      - name: 이메일 발송
+        if: |
+          env.SMTP_HOST != '' &&
+          env.NOTIFY_EMAIL != ''
+        env:
+          SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:     ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_USER:     ${{ secrets.SMTP_USER }}
+          SMTP_PASS:     ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL:  ${{ secrets.NOTIFY_EMAIL }}
+          KEYWORD:       ${{ steps.kw.outputs.value }}
+        run: |
+          python - <<'PYEOF'
+          import smtplib, os, glob
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.base import MIMEBase
+          from email.mime.text import MIMEText
+          from email import encoders
+          from datetime import date
+
+          pdfs = glob.glob("output/*.pdf")
+          if not pdfs:
+              print("PDF 없음, 발송 건너뜀")
+              raise SystemExit(0)
+
+          kw   = os.environ.get("KEYWORD", "공기업")
+          subj = f"[{kw}] 주요 언론 보도 {date.today():%Y년 %m월 %d일}"
+
+          msg = MIMEMultipart()
+          msg["Subject"] = subj
+          msg["From"]    = os.environ["SMTP_USER"]
+          msg["To"]      = os.environ["NOTIFY_EMAIL"]
+          msg.attach(MIMEText("첨부 PDF를 확인하세요.", "plain", "utf-8"))
+
+          for pdf in pdfs:
+              with open(pdf, "rb") as f:
+                  part = MIMEBase("application", "octet-stream")
+                  part.set_payload(f.read())
+              encoders.encode_base64(part)
+              part.add_header("Content-Disposition",
+                              f'attachment; filename="{os.path.basename(pdf)}"')
+              msg.attach(part)
+
+          host = os.environ["SMTP_HOST"]
+          port = int(os.environ["SMTP_PORT"])
+          with smtplib.SMTP(host, port) as s:
+              s.ehlo()
+              s.starttls()
+              s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+              s.send_message(msg)
+          print(f"이메일 발송 완료 → {os.environ['NOTIFY_EMAIL']}")
+          PYEOF
