@@ -59,13 +59,18 @@ def run(
         try:
             articles = search_naver_news(keyword, count=NEWS_COUNT)
             if not articles:
-                print("      [경고] 기사를 찾지 못했습니다. 인터넷 연결을 확인하세요.")
+                print("      [경고] 기사를 찾지 못했습니다.")
+                print("      → Google News RSS / Naver 모두 실패. 인터넷 연결을 확인하세요.")
                 articles = []
             else:
-                print(f"      → {len(articles)}개 기사 발견, 전문 수집 중...")
+                print(f"      → {len(articles)}개 기사 발견")
+                print(f"      → 기사 전문 수집 시작 (신문사 사이트 직접 접속)...")
                 articles = enrich_articles(articles)
+                with_content = sum(1 for a in articles if len(a.get("content","")) > 100)
+                print(f"      → 전문 수집 완료: {with_content}/{len(articles)}개")
         except Exception as e:
             print(f"      [경고] 뉴스 수집 실패: {e}")
+            import traceback; traceback.print_exc()
             articles = []
 
     # ── 3. Newspaper screenshots ─────────────────────────────────────────────

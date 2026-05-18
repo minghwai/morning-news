@@ -1,258 +1,273 @@
 """
-Naver News real-data scraper using Playwright + stealth mode.
+Korean news scraper — Google News RSS (primary) + Playwright article body extractor.
 
-Flow:
-  1. Search Naver News for keyword (sort=1 = latest)
-  2. Collect real article URLs, sources, dates, summaries
-  3. Visit each article URL → extract full article body text
+Why Google News RSS instead of Naver search:
+  - No bot detection / CAPTCHA
+  - Returns real article URLs from actual newspapers
+  - Clean structured XML (no fragile CSS selectors on search UI)
+  - Playwright is reserved only for article full-text extraction,
+    where it's proven to work on newspaper sites.
 """
 
 import re
 import os
 import time
 import datetime
+import requests
+import xml.etree.ElementTree as ET
 from urllib.parse import quote_plus
 
+# ── HTTP session for RSS + redirect resolution ────────────────────────────────
+_SESSION = requests.Session()
+_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+})
+
+# ── Playwright config ─────────────────────────────────────────────────────────
 _CHROME_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--no-zygote",
+    "--no-sandbox", "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage", "--disable-gpu", "--no-zygote",
     "--ignore-certificate-errors",
     "--disable-blink-features=AutomationControlled",
-    "--disable-infobars",
     "--window-size=1440,900",
 ]
-
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Article body selectors — ordered by reliability
+_ARTICLE_SELECTORS = [
+    # Naver News (hosted)
+    "#dic_area", "#articeBody", "#newsEndContents", "#articleBodyContents",
+    # 주요 신문사
+    "#article_txt",                     # 동아일보
+    "#articleText",                     # 경향신문
+    "#articleBody",                     # 국민일보
+    "#article_content",                 # 서울신문
+    ".article-body", ".article_body",   # 한국경제, 조선 등
+    "#newsViewArea",                    # 매일경제
+    ".news_cnt_detail_wrap",            # 매일경제 v2
+    ".article_txt",                     # 세계일보
+    ".view_text", ".article_view",      # 서울경제
+    ".article-text", ".article_text",   # 한겨레
+    ".article_body_content",            # 중앙일보
+    "#article-view-content-div",        # 일부 지역지
+    "div[itemprop='articleBody']",
+    "article",
+    "div[class*='article'][class*='body']",
+    "div[class*='article'][class*='content']",
+    ".view_content", ".news_view",
+]
 
-def _browser_exe():
+_NOISE = (
+    "script, style, figure, figcaption, "
+    ".ad, .advertisement, .reporter, .relate_news, "
+    ".photo_area, .vod_area, .copyright, "
+    ".article_relation, .ad_area, iframe, aside"
+)
+
+
+# ── Helper utilities ──────────────────────────────────────────────────────────
+
+def _clean_html(html: str) -> str:
+    """Strip HTML tags and unescape entities."""
+    text = re.sub(r"<[^>]+>", "", html or "")
+    for ent, ch in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                    ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " ")]:
+        text = text.replace(ent, ch)
+    return text.strip()
+
+
+def _parse_rss_date(pub_date: str) -> str:
+    """Convert RFC 2822 date (RSS pubDate) to Korean date string."""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(pub_date)
+        # Convert to KST (+9)
+        kst = dt.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+        return kst.strftime("%Y.%m.%d. %H:%M")
+    except Exception:
+        return datetime.date.today().strftime("%Y.%m.%d.")
+
+
+def _resolve_url(google_url: str) -> str:
+    """
+    Follow the Google News redirect to get the actual newspaper article URL.
+    Google News RSS <link>s are 302 redirects to the real article.
+    """
+    if not google_url or not google_url.startswith("http"):
+        return google_url or ""
+    try:
+        resp = _SESSION.get(google_url, allow_redirects=True, timeout=10)
+        final = resp.url
+        # If redirect brought us to a real newspaper (not google.com), use it
+        if "google.com" not in final and "google.co" not in final:
+            return final
+    except Exception:
+        pass
+    return google_url  # Keep Google URL as fallback
+
+
+def _browser_exe() -> str | None:
     custom = os.getenv("CHROME_EXECUTABLE")
     if custom and os.path.exists(custom):
         return custom
     return None
 
 
-def _stealth_context(browser):
-    """Create a stealth browser context."""
-    ctx = browser.new_context(
-        viewport={"width": 1440, "height": 900},
-        user_agent=_UA,
-        locale="ko-KR",
-        timezone_id="Asia/Seoul",
-        ignore_https_errors=True,
-        extra_http_headers={
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        },
+# ── Primary: Google News RSS ──────────────────────────────────────────────────
+
+def search_google_news_rss(keyword: str, count: int = 20) -> list[dict]:
+    """
+    Fetch Google News RSS for `keyword` and return structured article list.
+    Each dict: title, source, date, url (real newspaper URL), summary, content="".
+    """
+    rss_url = (
+        f"https://news.google.com/rss/search"
+        f"?q={quote_plus(keyword)}&hl=ko&gl=KR&ceid=KR:ko"
     )
-    return ctx
+    print(f"      → Google News RSS 요청: {rss_url[:80]}")
+
+    try:
+        resp = _SESSION.get(rss_url, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"      [오류] RSS 수집 실패: {e}")
+        return []
+
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as e:
+        print(f"      [오류] RSS XML 파싱 실패: {e}")
+        return []
+
+    items = root.findall(".//item")
+    print(f"      → RSS 아이템 {len(items)}개 발견")
+
+    articles = []
+    for item in items[:count]:
+        title    = _clean_html(item.findtext("title", ""))
+        glink    = item.findtext("link", "").strip()
+        pub_date = item.findtext("pubDate", "")
+        desc_raw = item.findtext("description", "")
+        desc     = _clean_html(desc_raw)[:500]
+
+        # Source name from <source> element
+        src_el = item.find("source")
+        source = (src_el.text or "").strip() if src_el is not None else ""
+
+        if not title or not glink:
+            continue
+
+        # Resolve actual article URL (follow Google redirect)
+        real_url = _resolve_url(glink)
+
+        articles.append({
+            "title":   title,
+            "source":  source,
+            "date":    _parse_rss_date(pub_date),
+            "url":     real_url,
+            "summary": desc,
+            "content": "",
+        })
+
+    print(f"      → URL 추적 완료: {len(articles)}개 기사")
+    return articles
 
 
-def _apply_stealth(page):
-    """Inject JS to hide headless browser signals."""
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR','ko','en-US','en']});
-        window.chrome = {runtime: {}};
-    """)
+# ── Fallback: Naver News (Playwright) ────────────────────────────────────────
 
-
-def search_naver_news(keyword: str, count: int = 20) -> list[dict]:
-    """
-    Search Naver News for `keyword` and return up to `count` articles.
-    Each article dict has: title, source, date, url, summary, content (empty until enriched).
-    """
+def _search_naver_playwright(keyword: str, count: int = 20) -> list[dict]:
+    """Fallback: scrape Naver News search results via Playwright."""
     from playwright.sync_api import sync_playwright
 
-    articles: list[dict] = []
-    page_no = 1
-
+    articles = []
     kwargs = {"args": _CHROME_ARGS}
     exe = _browser_exe()
     if exe:
         kwargs["executable_path"] = exe
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(**kwargs)
-        ctx = _stealth_context(browser)
-        page = ctx.new_page()
-        _apply_stealth(page)
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(**kwargs)
+            ctx = browser.new_context(
+                viewport={"width": 1440, "height": 900}, user_agent=_UA,
+                locale="ko-KR", ignore_https_errors=True,
+                extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9"},
+            )
+            page = ctx.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+            )
 
-        while len(articles) < count:
-            start = (page_no - 1) * 10 + 1
             url = (
                 f"https://search.naver.com/search.naver"
-                f"?where=news&query={quote_plus(keyword)}&sort=1&start={start}"
+                f"?where=news&query={quote_plus(keyword)}&sort=1"
             )
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                page.wait_for_timeout(1800)
-            except Exception as e:
-                print(f"[news] 네이버 뉴스 검색 페이지 로드 실패 (page {page_no}): {e}")
-                break
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            page.wait_for_timeout(3000)
 
-            batch = _parse_search_page(page)
-            if not batch:
-                break
+            print(f"      → Naver 검색 페이지 제목: {page.title()!r}")
 
-            articles.extend(batch)
-            if len(batch) < 10:
-                break
-            page_no += 1
+            # Extract via JS (most reliable, bypasses selector fragility)
+            raw = page.evaluate("""() => {
+                const results = [];
+                document.querySelectorAll('a.news_tit').forEach(a => {
+                    const li   = a.closest('li') || a.closest('div.news_wrap');
+                    const srcA = li ? li.querySelector('a.info.press, a[class*="press"]') : null;
+                    const date = li ? li.querySelector('span.info') : null;
+                    const desc = li ? li.querySelector('.dsc_wrap, .dsc_txt') : null;
+                    results.push({
+                        title:   a.innerText.trim(),
+                        url:     a.href,
+                        source:  srcA ? srcA.innerText.trim() : '',
+                        date:    date ? date.innerText.trim() : '',
+                        summary: desc ? desc.innerText.trim() : '',
+                    });
+                });
+                return results;
+            }""")
 
-        browser.close()
+            print(f"      → Naver JS 추출: {len(raw)}개")
+            for item in raw[:count]:
+                if item.get("title") and item.get("url"):
+                    articles.append({**item, "content": ""})
 
+            browser.close()
+    except Exception as e:
+        print(f"      [오류] Naver Playwright 수집 실패: {e}")
+
+    return articles
+
+
+# ── Public search entry point ─────────────────────────────────────────────────
+
+def search_naver_news(keyword: str, count: int = 20) -> list[dict]:
+    """
+    Main entry point: try Google News RSS first, fall back to Naver Playwright.
+    """
+    articles = search_google_news_rss(keyword, count)
+    if not articles:
+        print("      → RSS 실패, Naver News Playwright 방식 재시도...")
+        articles = _search_naver_playwright(keyword, count)
     return articles[:count]
 
 
-def _parse_search_page(page) -> list[dict]:
-    """Parse all article entries from a loaded Naver News search result page."""
-    results = []
-
-    # Naver News uses <li class="bx"> or <div class="news_area"> depending on skin
-    items = (
-        page.query_selector_all("li.bx")
-        or page.query_selector_all("div.news_wrap")
-        or page.query_selector_all("div.news_area")
-    )
-
-    for item in items:
-        art = _extract_one(item)
-        if art:
-            results.append(art)
-
-    return results
-
-
-def _extract_one(el) -> dict | None:
-    """Extract article data from a single search result element."""
-    # ── Title + URL ──────────────────────────────────────────────────────────
-    title_el = (
-        el.query_selector("a.news_tit")
-        or el.query_selector("a[class*='news_tit']")
-        or el.query_selector("div.news_area a[href*='naver']")
-        or el.query_selector("div.news_info a")
-    )
-    if not title_el:
-        return None
-
-    title = (title_el.inner_text() or "").strip()
-    url = (title_el.get_attribute("href") or "").strip()
-
-    if not title or not url.startswith("http"):
-        return None
-
-    # ── Source (언론사) ──────────────────────────────────────────────────────
-    src_el = (
-        el.query_selector("a.info.press")
-        or el.query_selector("a[class*='press']")
-        or el.query_selector("span.info_group a")
-    )
-    source = (src_el.inner_text() or "미확인").strip() if src_el else "미확인"
-
-    # ── Date ────────────────────────────────────────────────────────────────
-    date_str = ""
-    for span in (el.query_selector_all("span.info") + el.query_selector_all("span[class*='date']")):
-        t = (span.inner_text() or "").strip()
-        if re.search(r'\d+[시간분일]|어제|전|\d{4}\.\d{2}', t):
-            date_str = t
-            break
-    if not date_str:
-        date_str = datetime.date.today().strftime("%Y.%m.%d.")
-
-    # ── Summary ──────────────────────────────────────────────────────────────
-    desc_el = (
-        el.query_selector("div.dsc_wrap")
-        or el.query_selector("a.dsc_txt")
-        or el.query_selector("div[class*='dsc']")
-    )
-    summary = ""
-    if desc_el:
-        summary = (desc_el.inner_text() or "").strip()[:500]
-
-    return {
-        "title": title,
-        "source": source,
-        "date": date_str,
-        "url": url,
-        "summary": summary,
-        "content": "",
-    }
-
-
-# ── Full article content extraction ──────────────────────────────────────────
-
-#: Newspaper-specific CSS selectors for article body
-_ARTICLE_SELECTORS = [
-    # Naver News (mobile / PC)
-    "#dic_area",
-    "#articeBody",
-    "#newsEndContents",
-    "#articleBodyContents",
-    # 한국경제
-    ".article-body",
-    ".article_body",
-    "#article-view-content-div",
-    # 매일경제
-    ".news_cnt_detail_wrap",
-    "#newsViewArea",
-    # 조선일보
-    ".article-body",
-    "div[class*='article_body']",
-    # 동아일보
-    "#article_txt",
-    # 한겨레
-    ".article-text",
-    ".article_text",
-    # 중앙일보
-    ".article_body_content",
-    # 서울경제
-    ".article_view",
-    ".view_text",
-    # 한국일보
-    ".article-body",
-    # 경향신문
-    "#articleText",
-    # 세계일보
-    ".article_txt",
-    # 국민일보
-    "#articleBody",
-    # 서울신문
-    "#article_content",
-    # 일반 패턴
-    "article",
-    "div[itemprop='articleBody']",
-    "div[class*='article'][class*='content']",
-    "div[class*='article'][class*='body']",
-    "div[class*='news'][class*='content']",
-    "div[class*='news'][class*='body']",
-    ".news_view",
-    ".view_content",
-    "#content article",
-]
-
-_NOISE_SELECTORS = (
-    "script, style, figure, figcaption, .ad, .advertisement, "
-    ".reporter, .relate_news, .photo_area, .vod_area, "
-    ".copyright, .article_relation, .ad_area, iframe"
-)
-
+# ── Article full-text extractor (Playwright) ──────────────────────────────────
 
 def enrich_articles(articles: list[dict]) -> list[dict]:
     """
-    Visit each article URL and extract the full article body.
-    Reuses a single browser session for all articles.
+    Visit each article URL and extract the full article body text.
+    Uses a single Playwright browser session for all articles.
     """
     from playwright.sync_api import sync_playwright
 
@@ -266,76 +281,79 @@ def enrich_articles(articles: list[dict]) -> list[dict]:
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(**kwargs)
-        ctx = _stealth_context(browser)
+        ctx = browser.new_context(
+            viewport={"width": 1440, "height": 900}, user_agent=_UA,
+            locale="ko-KR", ignore_https_errors=True,
+        )
         page = ctx.new_page()
-        _apply_stealth(page)
+        page.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            "window.chrome={runtime:{}};"
+        )
 
-        # Block heavy resources that aren't needed for text extraction
+        # Block images / media to speed up page loads
         page.route(
             "**/*",
-            lambda route: route.abort()
-            if route.request.resource_type in ("image", "media", "font", "stylesheet")
-            else route.continue_(),
+            lambda r: r.abort()
+            if r.request.resource_type in ("image", "media", "font")
+            else r.continue_(),
         )
 
         for i, art in enumerate(articles):
             url = art.get("url", "")
-            print(f"    [{i+1:2d}/{len(articles)}] {art['source']:10s} | {art['title'][:40]}")
+            print(f"    [{i+1:2d}/{len(articles)}] {art.get('source',''):12s} | {art.get('title','')[:45]}")
 
             if not url or not url.startswith("http"):
                 art["content"] = art.get("summary", "")
                 continue
 
-            content = _fetch_article_body(page, url)
-            art["content"] = content if content else art.get("summary", "")
-            print(f"            → {len(art['content'])}자 수집")
+            content = _extract_body(page, url)
+            if content:
+                art["content"] = content
+                print(f"                 → {len(content)}자")
+            else:
+                art["content"] = art.get("summary", "")
+                print(f"                 → 본문 없음, 요약 사용")
 
         browser.close()
 
     return articles
 
 
-def _fetch_article_body(page, url: str, max_chars: int = 2000) -> str:
+def _extract_body(page, url: str, max_chars: int = 2500) -> str:
     """Navigate to article URL and extract full body text."""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1000)
     except Exception as e:
-        print(f"            → 접속 실패: {e}")
+        print(f"                 → 접속 실패: {e}")
         return ""
 
-    # Try each selector in priority order
     for sel in _ARTICLE_SELECTORS:
         try:
             el = page.query_selector(sel)
             if not el:
                 continue
-            # Remove noise elements
+            # Remove noise nodes
             page.eval_on_selector(
                 sel,
-                f"""el => el.querySelectorAll('{_NOISE_SELECTORS}').forEach(n => n.remove())"""
+                f"el => el.querySelectorAll('{_NOISE}').forEach(n => n.remove())"
             )
             text = (el.inner_text() or "").strip()
-            # Must be substantial text
             if len(text) > 150:
-                # Clean up: remove excessive blank lines
-                text = re.sub(r'\n{3,}', '\n\n', text)
-                text = re.sub(r'[ \t]{2,}', ' ', text)
+                text = re.sub(r"\n{3,}", "\n\n", text)
+                text = re.sub(r"[ \t]{2,}", " ", text)
                 return text[:max_chars]
         except Exception:
             continue
 
-    # Fallback: collect <p> tags
+    # Fallback: collect all <p> with substantial text
     try:
         paras = page.query_selector_all("p")
-        texts = []
-        for p in paras:
-            t = (p.inner_text() or "").strip()
-            if len(t) > 40:
-                texts.append(t)
-        combined = "\n\n".join(texts)
-        if len(combined) > 150:
-            return combined[:max_chars]
+        chunks = [(p.inner_text() or "").strip() for p in paras]
+        body = "\n\n".join(c for c in chunks if len(c) > 40)
+        if len(body) > 150:
+            return body[:max_chars]
     except Exception:
         pass
 

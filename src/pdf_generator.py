@@ -314,6 +314,14 @@ def build_toc(articles: list[dict], first_article_page: int = 3) -> list:
     story.append(Paragraph("▮ 주요 언론 보도", S["h1"]))
     story.append(Spacer(1, 3 * mm))
 
+    if not articles:
+        story.append(Paragraph(
+            "뉴스 기사를 수집하지 못했습니다. 네트워크 연결 또는 키워드를 확인하세요.",
+            _s("toc_empty", fontSize=9, textColor=RED, leading=14)
+        ))
+        story.append(PageBreak())
+        return story
+
     col_w = [9 * mm, 26 * mm, 112 * mm, 16 * mm]
     hdr_style = _s("toc_hdr", fontName="NanumBd", fontSize=8.5, textColor=WHITE,
                     alignment=TA_CENTER, leading=12)
@@ -395,6 +403,20 @@ def _source_color(source: str) -> object:
 
 def build_articles(articles: list[dict]) -> list:
     story = []
+
+    if not articles:
+        story.append(Spacer(1, 10 * mm))
+        story.append(Paragraph(
+            "수집된 기사가 없습니다.",
+            _s("no_art", fontName="NanumBd", fontSize=12, textColor=RED,
+               alignment=TA_CENTER, leading=16)
+        ))
+        story.append(Spacer(1, 4 * mm))
+        story.append(Paragraph(
+            "인터넷 연결 상태를 확인하거나, 키워드를 변경해서 다시 실행하세요.",
+            _s("no_art_sub", fontSize=9, textColor=GRAY, alignment=TA_CENTER)
+        ))
+        return story
 
     for i, art in enumerate(articles, 1):
         title   = art.get("title", "(제목 없음)")
