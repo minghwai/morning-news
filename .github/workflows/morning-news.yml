@@ -1,0 +1,120 @@
+name: 공기업 주요 언론 보도 PDF
+
+on:
+  schedule:
+    # 매일 오전 8:00 KST = 23:00 UTC (전날)
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: '검색 키워드 (예: 한국전력공사)'
+        required: false
+        default: '한국전력공사'
+      no_screenshot:
+        description: '신문사 스크린샷 생략 여부'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+env:
+  DEFAULT_KEYWORD: '한국전력공사'
+  TZ: 'Asia/Seoul'
+
+jobs:
+  generate-pdf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 시스템 의존성 설치 (한국어 폰트, X 서버)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fonts-nanum xvfb libgbm1 libasound2
+
+      - name: Python 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: Playwright Chromium 설치
+        run: playwright install chromium --with-deps
+
+      - name: 오늘 날짜 환경변수 설정
+        run: echo "DATE=$(TZ=Asia/Seoul date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: 보고서 키워드 결정
+        id: keyword
+        run: |
+          KW="${{ github.event.inputs.keyword }}"
+          if [ -z "$KW" ]; then KW="${{ env.DEFAULT_KEYWORD }}"; fi
+          echo "value=$KW" >> $GITHUB_OUTPUT
+
+      - name: PDF 생성
+        env:
+          KEYWORD: ${{ steps.keyword.outputs.value }}
+          NO_SCREENSHOT: ${{ github.event.inputs.no_screenshot || 'false' }}
+        run: |
+          if [ "$NO_SCREENSHOT" = "true" ]; then
+            python -m src.main --keyword "$KEYWORD" --no-screenshot
+          else
+            xvfb-run --auto-servernum python -m src.main --keyword "$KEYWORD"
+          fi
+
+      - name: PDF Artifact 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: morning-news-${{ steps.keyword.outputs.value }}-${{ env.DATE }}
+          path: output/*.pdf
+          retention-days: 90
+
+      # 이메일 발송 (SMTP 환경변수가 설정된 경우)
+      - name: 이메일 발송 (선택)
+        if: env.SMTP_HOST != '' && env.NOTIFY_EMAIL != ''
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          python -c "
+          import smtplib, os, glob
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.base import MIMEBase
+          from email.mime.text import MIMEText
+          from email import encoders
+          from datetime import date
+
+          pdfs = glob.glob('output/*.pdf')
+          if not pdfs:
+              print('PDF 없음, 발송 건너뜀')
+              exit(0)
+
+          msg = MIMEMultipart()
+          msg['Subject'] = f'[${{ steps.keyword.outputs.value }}] 주요 언론 보도 {date.today():%Y년 %m월 %d일}'
+          msg['From'] = os.environ['SMTP_USER']
+          msg['To'] = os.environ['NOTIFY_EMAIL']
+          msg.attach(MIMEText('첨부파일을 확인하세요.', 'plain', 'utf-8'))
+
+          for pdf in pdfs:
+              with open(pdf, 'rb') as f:
+                  part = MIMEBase('application', 'octet-stream')
+                  part.set_payload(f.read())
+              encoders.encode_base64(part)
+              part.add_header('Content-Disposition', f'attachment; filename=\"{os.path.basename(pdf)}\"')
+              msg.attach(part)
+
+          with smtplib.SMTP(os.environ['SMTP_HOST'], int(os.environ.get('SMTP_PORT', 587))) as s:
+              s.starttls()
+              s.login(os.environ['SMTP_USER'], os.environ['SMTP_PASS'])
+              s.send_message(msg)
+          print('이메일 발송 완료')
+          "
