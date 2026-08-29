@@ -1,0 +1,103 @@
+name: 공기업 주요 언론 보도 조간지
+
+on:
+  schedule:
+    # 매일 08:00 KST = 23:00 UTC (전날). 시각을 바꾸려면 UTC 기준으로 고칠 것.
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: '검색 키워드'
+        required: false
+        default: '한국전력공사'
+      hours_back:
+        description: '수집 범위 (0=오늘 00시 이후, 24=최근 24시간)'
+        required: false
+        default: '0'
+      source:
+        description: '수집원 (naver=오픈API 키 필요, rss=키 불필요)'
+        required: false
+        default: 'naver'
+        type: choice
+        options: ['naver', 'rss']
+      send_mail:
+        description: '메일 발송 여부'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: morning-news
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # secrets는 if 조건에서 직접 못 읽으므로 job 레벨 env로 승격한다.
+      HAS_MAIL: ${{ secrets.SMTP_HOST != '' && secrets.NOTIFY_EMAIL != '' }}
+      KEYWORD: ${{ github.event.inputs.keyword || '한국전력공사' }}
+      HOURS_BACK: ${{ github.event.inputs.hours_back || '0' }}
+      SEND_MAIL: ${{ github.event.inputs.send_mail || 'true' }}
+      # 자동 실행 때 쓸 기본 수집원. 저장소 Variables에 NEWS_SOURCE=rss 를 넣으면
+      # 네이버 키 없이 구글 뉴스 RSS로 매일 돌아간다.
+      NEWS_SOURCE: ${{ github.event.inputs.source || vars.NEWS_SOURCE || 'naver' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      # 한글 폰트는 fonts/ 에 커밋되어 있으므로 apt 설치가 필요 없다.
+      # 브라우저도 쓰지 않으므로 Playwright/Xvfb도 필요 없다.
+
+      - name: 날짜 기록 (KST)
+        run: echo "DATE=$(TZ=Asia/Seoul date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: 조간지 생성 및 발송
+        env:
+          NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          SMTP_HOST:    ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:    ${{ secrets.SMTP_PORT || '465' }}
+          SMTP_USER:    ${{ secrets.SMTP_USER }}
+          SMTP_PASS:    ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          ARGS="--keyword \"$KEYWORD\" --hours-back $HOURS_BACK --source $NEWS_SOURCE"
+          if [ "$SEND_MAIL" != "true" ] || [ "$HAS_MAIL" != "true" ]; then
+            ARGS="$ARGS --no-mail"
+            echo "::notice::메일 발송을 건너뜁니다 (SEND_MAIL=$SEND_MAIL, HAS_MAIL=$HAS_MAIL)"
+          fi
+          eval python -m src.main $ARGS
+
+      - name: 아카이브 커밋 (누적 저장)
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data docs
+          if git diff --staged --quiet; then
+            echo "변경 사항 없음 — 커밋 생략"
+          else
+            git commit -m "archive: $DATE $KEYWORD"
+            git push
+          fi
+
+      # Artifact 업로드는 쓰지 않는다.
+      # 무료 계정의 Artifact 저장 용량(500MB)이 금방 차서 실행이 실패하기 때문이다.
+      # PDF는 메일로 오고, 원본 데이터는 data/ 에 커밋되므로 Artifact가 필요 없다.
