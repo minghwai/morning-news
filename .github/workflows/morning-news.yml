@@ -75,6 +75,7 @@ jobs:
           SMTP_HOST:    ${{ secrets.SMTP_HOST }}
           SMTP_PORT:    ${{ secrets.SMTP_PORT || '465' }}
           SMTP_USER:    ${{ secrets.SMTP_USER }}
+          SMTP_LOGIN:   ${{ secrets.SMTP_LOGIN }}
           SMTP_PASS:    ${{ secrets.SMTP_PASS }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
         run: |
@@ -85,8 +86,9 @@ jobs:
           fi
           eval python -m src.main $ARGS
 
+      # 메일 발송이 실패해도 수집·아카이브 결과는 남긴다.
       - name: 아카이브 커밋 (누적 저장)
-        if: success()
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
